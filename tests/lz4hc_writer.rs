@@ -369,6 +369,49 @@ fn the_index_holds_what_the_kernel_requires_of_it() {
     }
 }
 
+/// A file that ends inside a block of a compressed pcluster ends with a
+/// PLAIN head at its end, as `mkfs.erofs` writes it: without a head after
+/// it, older kernels, 5.10 among them, decompress the last pcluster to the
+/// end of the block the file ends in, which is more than its data holds,
+/// and the read fails with EIO. A file that ends on a block boundary, or in a
+/// block stored as it is, needs none.
+#[test]
+fn a_file_ending_inside_a_compressed_block_ends_with_a_head() {
+    use fs_erofs::zmap::{
+        Z_EROFS_LCLUSTER_TYPE_NONHEAD as NONHEAD, Z_EROFS_LCLUSTER_TYPE_PLAIN as PLAIN,
+    };
+    let sizes = [5000usize, 8192, 12_000, 75_811, 100_000, 1_713_440];
+    let names: Vec<String> = sizes.iter().map(|s| format!("s{s}")).collect();
+    let files: Vec<Vec<u8>> = sizes.iter().map(|&s| text(s, s as u64)).collect();
+    let tree = dir(names
+        .iter()
+        .zip(&files)
+        .map(|(n, d)| (n.as_str(), file(d)))
+        .collect());
+    let img = mkfs::build_image_with(tree, 12, options()).unwrap();
+    let dev = common::MemDev::new(img.clone());
+    let fs = open_image(img);
+    for (name, data) in names.iter().zip(&files) {
+        let path = format!("/{name}");
+        assert_eq!(read_back(&fs, &path), *data, "{name}");
+        let inode = fs.lookup_path(&path).unwrap();
+        let zmap = ZMap::open(&dev as &dyn BlockRead, fs.superblock(), &inode).unwrap();
+        let last = zmap
+            .read_lcluster(&dev as &dyn BlockRead, zmap.n_lclusters() - 1)
+            .unwrap();
+        let tail = (data.len() % 4096) as u16;
+        if tail == 0 {
+            assert_eq!(last.cluster_type, NONHEAD, "{name}: a head past the end");
+        } else {
+            assert_eq!(
+                (last.cluster_type, last.clusterofs),
+                (PLAIN, tail),
+                "{name}: no head at the end"
+            );
+        }
+    }
+}
+
 /// A file is compressed in 4 MiB segments, each starting a fresh pcluster
 /// at a block boundary, so they can be compressed on any thread and the
 /// image does not depend on how many there were: the lcluster at every
